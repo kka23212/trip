@@ -234,6 +234,7 @@
     vertical-align:middle;
   }
   .link-chip:hover{ background:var(--pink-2); }
+  button.link-chip{ border:none; font-family:inherit; }
   .item-actions{
     display:flex; gap:6px;
   }
@@ -265,7 +266,7 @@
   .overlay{
     position:fixed; inset:0; background:rgba(90,67,86,.35);
     display:none; align-items:center; justify-content:center;
-    padding:20px; z-index:50;
+    padding:20px; z-index:3000; /* Leaflet's own controls/markers use z-index up to ~1000, so this has to stay above that or the map pokes through open popups */
   }
   .overlay.show{display:flex;}
   .modal{
@@ -285,6 +286,9 @@
   }
   .field input:focus, .field textarea:focus{border-color:var(--pink-3);}
   .field textarea{resize:none; height:50px;}
+  .field input[type="color"]{
+    padding:4px; height:42px; width:100%; cursor:pointer;
+  }
   .modal-actions{ display:flex; gap:10px; margin-top:18px; }
   .btn{
     flex:1; border:none; border-radius:14px; padding:11px; font-family:'Jua';
@@ -355,8 +359,14 @@
       <input type="text" id="f-title" placeholder="예: 🐷카페" />
     </div>
     <div class="field">
-      <label>장소</label>
-      <input type="text" id="f-place" placeholder="예: 광안리 해변 근처" />
+      <label>장소 (주소나 장소명을 입력하면 지도에 자동으로 표시돼요)</label>
+      <input type="text" id="f-place" placeholder="예: 부산 수영구 광안해변로 219" />
+      <div id="f-place-status" style="font-size:12px; color:var(--ink-soft); margin-top:5px;"></div>
+      <button type="button" class="btn ghost" id="pickOnMapBtn" style="margin-top:8px; width:100%; padding:8px;">🗺️ 대신 지도에서 위치 직접 찍기</button>
+    </div>
+    <div class="field">
+      <label>색상 (이 일정 카드/지도 핀 색깔)</label>
+      <input type="color" id="f-color" value="#FF6FA9" />
     </div>
     <div class="field">
       <label>링크 (선택 · 지도/인스타 등 링크를 붙여넣으면 클릭해서 바로 이동돼요)</label>
@@ -488,6 +498,13 @@
 
   let currentDay = 1;
   let editing = null; // {day, index} or null when adding new
+
+  // location picking for the current item modal session:
+  // pendingCoords/pendingCoordsFor = result of auto-geocoding the typed address (set on blur)
+  // pendingPickedLatLng = a manually-clicked point on the map (takes priority over geocoding)
+  let pendingCoords = null;
+  let pendingCoordsFor = null;
+  let pendingPickedLatLng = null;
 
   // ---------------- TRIP INFO ----------------
   let tripInfo = {
@@ -654,17 +671,19 @@
           </div>`;
         return;
       }
+      const accent = item.color || defaultItemColor(currentDay);
+      const mapChip = (item.lat !== undefined) ? `<button type="button" class="link-chip" onclick="focusMapOnItem(${currentDay}, ${idx})">🗺️ 지도에서 보기</button>` : '';
       html += `
-        <div class="item">
+        <div class="item" style="border-left:6px solid ${accent};">
           <div class="item-top">
-            <span class="time">${item.time || '--:--'}</span>
+            <span class="time" style="background:${accent};">${item.time || '--:--'}</span>
             <div class="item-actions">
               <button class="icon-btn" onclick="openEdit(${currentDay}, ${idx})">✎</button>
               <button class="icon-btn del" onclick="removeItem(${currentDay}, ${idx})">✕</button>
             </div>
           </div>
           <div class="item-title">${item.title}${item.tbd ? '<span class="tbd">장소 미정</span>' : ''}</div>
-          ${item.place ? `<div class="item-place">📍 ${linkify(item.place)}${item.link ? `<a href="${item.link}" target="_blank" rel="noopener noreferrer" class="link-chip">🔗 바로가기</a>` : ''}</div>` : (item.link ? `<div class="item-place"><a href="${item.link}" target="_blank" rel="noopener noreferrer" class="link-chip">🔗 바로가기</a></div>` : '')}
+          ${item.place ? `<div class="item-place">📍 ${linkify(item.place)}${item.link ? `<a href="${item.link}" target="_blank" rel="noopener noreferrer" class="link-chip">🔗 바로가기</a>` : ''}${mapChip}</div>` : (item.link ? `<div class="item-place"><a href="${item.link}" target="_blank" rel="noopener noreferrer" class="link-chip">🔗 바로가기</a></div>` : '')}
           ${item.note ? `<div class="item-note">💭 ${linkify(item.note)}</div>` : ''}
         </div>
       `;
@@ -684,12 +703,25 @@
   }
 
   // ---------------- ADD / EDIT MODAL ----------------
+  function resetPending(){
+    pendingCoords = null;
+    pendingCoordsFor = null;
+    pendingPickedLatLng = null;
+  }
+
+  function defaultItemColor(day){
+    return DAY_COLORS[(day-1) % DAY_COLORS.length];
+  }
+
   function openAdd(){
     editing = {day: currentDay, index: null};
+    resetPending();
     document.getElementById('modalTitle').textContent = "일정 추가하기 🐱";
     document.getElementById('f-time').value = "";
     document.getElementById('f-title').value = "";
     document.getElementById('f-place').value = "";
+    document.getElementById('f-place-status').textContent = "";
+    document.getElementById('f-color').value = defaultItemColor(currentDay);
     document.getElementById('f-link').value = "";
     document.getElementById('f-note').value = "";
     document.getElementById('overlay').classList.add('show');
@@ -697,24 +729,37 @@
 
   function openEdit(day, idx){
     editing = {day, index: idx};
+    resetPending();
     const item = data[day].items[idx];
     document.getElementById('modalTitle').textContent = "일정 수정하기 🐾";
     document.getElementById('f-time').value = item.time || "";
     document.getElementById('f-title').value = item.title || "";
     document.getElementById('f-place').value = item.place || "";
+    document.getElementById('f-color').value = item.color || defaultItemColor(day);
     document.getElementById('f-link').value = item.link || "";
     document.getElementById('f-note').value = item.note || "";
     document.getElementById('overlay').classList.add('show');
+    const status = document.getElementById('f-place-status');
+    if(item.place && item.lat !== undefined){
+      status.textContent = '📍 지도에 표시된 위치예요';
+    } else if(item.place){
+      status.textContent = '';
+      checkPlaceGeocode(); // this item's place was never resolved (e.g. added before this feature) -- try now
+    } else {
+      status.textContent = '';
+    }
   }
 
   function closeModal(){
     document.getElementById('overlay').classList.remove('show');
     editing = null;
+    resetPending();
   }
 
   function removeItem(day, idx){
     data[day].items.splice(idx, 1);
     render();
+    renderMapPins();
     saveLocal();
     syncPush();
   }
@@ -724,12 +769,115 @@
     if(e.target.id === 'overlay') closeModal();
   });
 
+  // ---- address -> map coordinates (auto-geocoding) ----
+  // Uses the free public Nominatim (OpenStreetMap) search API. Plain GET with
+  // no custom headers on purpose -- adding headers like Content-Type/Accept
+  // triggers a CORS preflight that this server doesn't reliably answer.
+  async function geocodeAddress(query){
+    const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=${encodeURIComponent(query)}`;
+    const res = await fetch(url);
+    if(!res.ok) throw new Error('geocode ' + res.status + (await errDetail(res)));
+    const arr = await res.json();
+    if(!arr || !arr.length) return null;
+    return { lat: parseFloat(arr[0].lat), lng: parseFloat(arr[0].lon) };
+  }
+
+  async function checkPlaceGeocode(){
+    const place = document.getElementById('f-place').value.trim();
+    const status = document.getElementById('f-place-status');
+    if(!place){ status.textContent = ''; pendingCoords = null; pendingCoordsFor = null; return; }
+
+    const existing = (editing && editing.index !== null) ? data[editing.day].items[editing.index] : null;
+    if(existing && existing.place === place && existing.lat !== undefined){
+      status.textContent = '📍 지도에 표시된 위치예요';
+      pendingCoords = null; pendingCoordsFor = null;
+      return;
+    }
+    status.textContent = '🔍 위치 찾는 중...';
+    try{
+      const result = await geocodeAddress(place);
+      if(result){
+        pendingCoords = result; pendingCoordsFor = place;
+        status.textContent = '✅ 지도에서 위치를 찾았어! 저장하면 표시돼요';
+      } else {
+        pendingCoords = null; pendingCoordsFor = place;
+        status.textContent = '❌ 이 주소로는 위치를 못 찾았어. "지도에서 직접 찍기"를 써줘!';
+      }
+    }catch(e){
+      pendingCoords = null; pendingCoordsFor = place;
+      status.textContent = '⚠️ 위치 찾기 실패 (' + e.message + '). "지도에서 직접 찍기"를 써줘!';
+    }
+  }
+  document.getElementById('f-place').addEventListener('blur', checkPlaceGeocode);
+
+  // ---- manual "click on the map" location picking (always works, no network needed) ----
+  document.getElementById('pickOnMapBtn').addEventListener('click', ()=>{
+    if(!map){ alert('지도가 아직 준비되지 않았어. 잠시 후 다시 시도해줘!'); return; }
+    document.getElementById('overlay').classList.remove('show');
+    const status = document.getElementById('f-place-status');
+    status.textContent = '🗺️ 지도를 클릭해서 이 일정의 위치를 선택해줘!';
+    const onMapClick = (e) => {
+      pendingPickedLatLng = { lat: e.latlng.lat, lng: e.latlng.lng };
+      pendingCoords = null; pendingCoordsFor = null;
+      map.off('click', onMapClick);
+      document.getElementById('overlay').classList.add('show');
+      document.getElementById('f-place-status').textContent =
+        `📍 위치 선택 완료 (${e.latlng.lat.toFixed(4)}, ${e.latlng.lng.toFixed(4)})`;
+    };
+    map.on('click', onMapClick);
+  });
+
+  // ---- rate-limited geocoding queue (max ~1 request/sec, per Nominatim's usage policy) ----
+  // used as a fallback when an item is saved before checkPlaceGeocode() finishes
+  // (e.g. hitting Enter right after typing), and to backfill older items that
+  // were created before this feature existed.
+  let geocodeQueue = [];
+  let geocodeBusy = false;
+  function queueGeocode(item, query){
+    geocodeQueue.push({item, query});
+    runGeocodeQueue();
+  }
+  async function runGeocodeQueue(){
+    if(geocodeBusy) return;
+    geocodeBusy = true;
+    let updated = false;
+    while(geocodeQueue.length){
+      const {item, query} = geocodeQueue.shift();
+      try{
+        const result = await geocodeAddress(query);
+        if(result){
+          item.lat = result.lat;
+          item.lng = result.lng;
+          item.geocodedPlace = query;
+          renderMapPins();
+          updated = true;
+        }
+      }catch(e){ /* leave item without coords -- user can still pick manually */ }
+      if(geocodeQueue.length) await new Promise(r => setTimeout(r, 1100));
+    }
+    geocodeBusy = false;
+    if(updated){ saveLocal(); syncPush(); }
+  }
+
+  // backfill: find any item that has a place/address but was never geocoded yet
+  // (older items from before this feature, or ones just brought in via sync/import)
+  function queueMissingGeocodes(){
+    Object.keys(data).forEach(d => {
+      data[d].items.forEach(item => {
+        if(!item.move && item.place && (item.lat === undefined || item.geocodedPlace !== item.place)){
+          queueGeocode(item, item.place);
+        }
+      });
+    });
+  }
+
   document.getElementById('saveBtn').addEventListener('click', ()=>{
     const time = document.getElementById('f-time').value;
     const title = document.getElementById('f-title').value.trim();
     const place = document.getElementById('f-place').value.trim();
     let link = document.getElementById('f-link').value.trim();
     const note = document.getElementById('f-note').value.trim();
+    const color = document.getElementById('f-color').value;
 
     if(!title){
       alert('일정 제목을 입력해줘!');
@@ -739,7 +887,23 @@
       link = 'https://' + link;
     }
 
-    const newItem = { time, title, place, link, note, tbd: !place && !link && !!title };
+    const newItem = { time, title, place, link, note, color, tbd: !place && !link && !!title };
+
+    // carry over / assign map coordinates for the new place text
+    const prevItem = (editing.index !== null) ? data[editing.day].items[editing.index] : null;
+    if(pendingPickedLatLng){
+      newItem.lat = pendingPickedLatLng.lat;
+      newItem.lng = pendingPickedLatLng.lng;
+      newItem.geocodedPlace = place;
+    } else if(pendingCoords && pendingCoordsFor === place){
+      newItem.lat = pendingCoords.lat;
+      newItem.lng = pendingCoords.lng;
+      newItem.geocodedPlace = place;
+    } else if(prevItem && prevItem.place === place && prevItem.lat !== undefined){
+      newItem.lat = prevItem.lat;
+      newItem.lng = prevItem.lng;
+      newItem.geocodedPlace = prevItem.geocodedPlace;
+    }
 
     if(editing.index === null){
       data[editing.day].items.push(newItem);
@@ -756,8 +920,16 @@
       return a.time.localeCompare(b.time);
     });
 
+    // safety net: if we still don't have coordinates but there's a place to
+    // look up (e.g. saved via Enter key before the blur-triggered lookup finished),
+    // queue it -- runGeocodeQueue() will fill it in and re-render the map shortly.
+    if(place && newItem.lat === undefined){
+      queueGeocode(newItem, place);
+    }
+
     closeModal();
     render();
+    renderMapPins();
     saveLocal();
     syncPush();
   });
@@ -959,6 +1131,7 @@
     renderMapPins();
     render();
     saveLocal();
+    queueMissingGeocodes();
   }
 
   function setSyncStatus(text){
@@ -1137,12 +1310,42 @@
     mapPinMarkers.forEach(m => map.removeLayer(m));
     mapPinMarkers = [];
     for(let d=1; d<=maxDay(); d++){
-      const coord = BASE_COORDS[(d-1) % BASE_COORDS.length];
-      const color = DAY_COLORS[(d-1) % DAY_COLORS.length];
-      const marker = L.marker(coord, {icon: makeDayIcon(color)}).addTo(map)
-        .bindPopup(`<b>Day${d}</b><br>${data[d].loc}`);
-      mapPinMarkers.push(marker);
+      const dayColor = DAY_COLORS[(d-1) % DAY_COLORS.length];
+      const geocodedItems = data[d].items.filter(it => !it.move && it.lat !== undefined && it.lng !== undefined);
+
+      if(geocodedItems.length === 0){
+        // no addresses pinned yet for this day -- show a placeholder so the map isn't empty
+        const coord = BASE_COORDS[(d-1) % BASE_COORDS.length];
+        const marker = L.marker(coord, {icon: makeDayIcon(dayColor)}).addTo(map)
+          .bindPopup(`<b>Day${d}</b><br>${data[d].loc}<br><span style="font-size:12px;color:#999;">아직 등록된 장소가 없어요</span>`);
+        mapPinMarkers.push(marker);
+        continue;
+      }
+
+      data[d].items.forEach((item, idx) => {
+        if(item.move || item.lat === undefined || item.lng === undefined) return;
+        const color = item.color || dayColor;
+        const marker = L.marker([item.lat, item.lng], {icon: makeDayIcon(color)}).addTo(map)
+          .bindPopup(`<b>Day${d}${item.time ? ' · ' + item.time : ''}</b><br>${item.title}${item.place ? '<br>📍 ' + item.place : ''}`);
+        marker._tripDay = d;
+        marker._tripIdx = idx;
+        mapPinMarkers.push(marker);
+      });
     }
+  }
+
+  function focusMapOnItem(day, idx){
+    const item = data[day] && data[day].items[idx];
+    if(!item || item.lat === undefined || item.lng === undefined){
+      alert('아직 지도에 위치가 표시되지 않았어. 잠시 기다리거나, 수정하기에서 "지도에서 직접 찍기"를 써줘!');
+      return;
+    }
+    if(!map) return;
+    map.setView([item.lat, item.lng], 16);
+    const marker = mapPinMarkers.find(m => m._tripDay === day && m._tripIdx === idx);
+    if(marker) marker.openPopup();
+    const mapEl = document.getElementById('map');
+    if(mapEl) mapEl.scrollIntoView({behavior:'smooth', block:'center'});
   }
 
   window.addEventListener('load', () => {
@@ -1165,6 +1368,7 @@
   renderTabs();
   renderMapLegend();
   render();
+  queueMissingGeocodes();
 
   // if this file was opened with #sync=<code> in the address (e.g. a link shared
   // by a friend), join that session -- otherwise, if this device previously
