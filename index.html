@@ -430,6 +430,24 @@
       <button class="btn ghost" id="syncCreateBtn">새 코드 만들기</button>
       <button class="btn primary" id="syncJoinBtn">코드로 참여하기</button>
     </div>
+
+    <div class="sync-note" style="margin-top:10px;">
+      🔌 위 방법이 인터넷 오류로 안 될 땐, 아래 걸로도 공유할 수 있어. 자동으로 반영되진 않고, 코드를 만들 때마다 카톡 등으로 보내주면 친구가 붙여넣는 방식이야 (인터넷 상태와 상관없이 항상 작동해).
+    </div>
+    <div class="field">
+      <label>📋 코드 내보내기</label>
+      <div class="sync-code-box">
+        <input type="text" id="exportCodeText" readonly placeholder="아래 버튼을 눌러서 만들어줘" />
+        <button class="copy-btn" id="exportCopyBtn">복사</button>
+      </div>
+      <button class="btn ghost" id="exportMakeBtn" style="margin-top:8px; width:100%;">지금 내용으로 코드 만들기</button>
+    </div>
+    <div class="field">
+      <label>📋 코드 가져오기</label>
+      <input type="text" id="importCodeText" placeholder="친구가 보내준 코드 붙여넣기" />
+      <button class="btn primary" id="importApplyBtn" style="margin-top:8px; width:100%;">이 코드로 업데이트하기</button>
+    </div>
+
     <div class="modal-actions">
       <button class="btn ghost" id="syncCloseBtn" style="flex:none; width:100%;">닫기</button>
     </div>
@@ -831,33 +849,43 @@
   // arbitrary origins (kvdb.io was removed -- its real create endpoint needs
   // an account email and its CORS support is undocumented, which is why it
   // was failing with a 500 before).
+  // reads a failed response's body (truncated) so error alerts show the
+  // server's *actual* validation message instead of just a status code --
+  // this is what let us pin down each backend's real requirements.
+  async function errDetail(res){
+    try{
+      const t = (await res.text()).trim();
+      return t ? (': ' + t.slice(0, 150)) : '';
+    }catch(e){ return ''; }
+  }
+
   const SYNC_BACKENDS = {
     jsonstorage: {
       async create(bodyText){
         const res = await fetch('https://api.jsonstorage.net/v1/json', {
           method: 'POST',
-          headers: {'Content-Type': 'application/json'},
+          headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
           body: bodyText
         });
-        if(!res.ok) throw new Error('jsonstorage create ' + res.status);
+        if(!res.ok) throw new Error('jsonstorage create ' + res.status + (await errDetail(res)));
         const json = await res.json();
         const uri = json && json.uri;
         const m = uri && uri.match(/\/v1\/json\/(.+)$/);
-        if(!m) throw new Error('jsonstorage: no id');
+        if(!m) throw new Error('jsonstorage: no id in response');
         return m[1]; // "{userId}/{itemId}"
       },
       async read(id){
         const res = await fetch(`https://api.jsonstorage.net/v1/json/${id}`);
-        if(!res.ok) throw new Error('jsonstorage read ' + res.status);
+        if(!res.ok) throw new Error('jsonstorage read ' + res.status + (await errDetail(res)));
         return res.text();
       },
       async write(id, bodyText){
         const res = await fetch(`https://api.jsonstorage.net/v1/json/${id}`, {
           method: 'PUT',
-          headers: {'Content-Type': 'application/json'},
+          headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
           body: bodyText
         });
-        if(!res.ok) throw new Error('jsonstorage write ' + res.status);
+        if(!res.ok) throw new Error('jsonstorage write ' + res.status + (await errDetail(res)));
       }
     },
     jsonblob: {
@@ -867,15 +895,15 @@
           headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
           body: bodyText
         });
-        if(!res.ok) throw new Error('jsonblob create ' + res.status);
+        if(!res.ok) throw new Error('jsonblob create ' + res.status + (await errDetail(res)));
         const loc = res.headers.get('Location') || '';
         const id = loc.split('/').filter(Boolean).pop();
-        if(!id) throw new Error('jsonblob: no id');
+        if(!id) throw new Error('jsonblob: no id in response');
         return id;
       },
       async read(id){
         const res = await fetch(`https://jsonblob.com/api/jsonBlob/${id}`);
-        if(!res.ok) throw new Error('jsonblob read ' + res.status);
+        if(!res.ok) throw new Error('jsonblob read ' + res.status + (await errDetail(res)));
         return res.text();
       },
       async write(id, bodyText){
@@ -884,7 +912,7 @@
           headers: {'Content-Type': 'application/json'},
           body: bodyText
         });
-        if(!res.ok) throw new Error('jsonblob write ' + res.status);
+        if(!res.ok) throw new Error('jsonblob write ' + res.status + (await errDetail(res)));
       }
     }
   };
@@ -1028,7 +1056,7 @@
     document.getElementById('syncOverlay').classList.add('show');
     if(syncId){
       document.getElementById('syncCodeDisplay').style.display = 'block';
-      document.getElementById('syncCodeText').value = syncId;
+      document.getElementById('syncCodeText').value = shareCode();
       setSyncStatus('연결됨');
     }
   }
@@ -1050,6 +1078,46 @@
     const input = document.getElementById('syncCodeText');
     input.select();
     document.execCommand('copy');
+  });
+
+  // ---- offline export/import code (no network needed -- always works) ----
+  // Unicode-safe base64: Korean text has char codes above 255, so plain
+  // btoa() would throw -- encodeURIComponent+unescape maps it to a byte
+  // string first.
+  function exportCode(){
+    return 'TRIP1:' + btoa(unescape(encodeURIComponent(currentPayloadText())));
+  }
+  function importCode(rawCode){
+    const c = rawCode.trim();
+    const m = c.match(/^TRIP1:([\s\S]+)$/);
+    const b64 = m ? m[1] : c;
+    const text = decodeURIComponent(escape(atob(b64)));
+    const obj = JSON.parse(text);
+    if(!obj || !obj.tripInfo || !obj.data) throw new Error('bad payload');
+    applyPayload(obj);
+  }
+
+  document.getElementById('exportMakeBtn').addEventListener('click', ()=>{
+    const input = document.getElementById('exportCodeText');
+    input.value = exportCode();
+    input.select();
+  });
+  document.getElementById('exportCopyBtn').addEventListener('click', ()=>{
+    const input = document.getElementById('exportCodeText');
+    if(!input.value){ alert('먼저 "지금 내용으로 코드 만들기"를 눌러줘!'); return; }
+    input.select();
+    document.execCommand('copy');
+  });
+  document.getElementById('importApplyBtn').addEventListener('click', ()=>{
+    const code = document.getElementById('importCodeText').value;
+    if(!code.trim()){ alert('코드를 입력해줘!'); return; }
+    try{
+      importCode(code);
+      document.getElementById('importCodeText').value = '';
+      alert('친구 코드로 업데이트했어! 🎉');
+    }catch(e){
+      alert('코드를 읽을 수 없어. 정확히 복사됐는지 다시 확인해줘!');
+    }
   });
 
   // ---------------- MAP ----------------
