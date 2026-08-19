@@ -610,6 +610,7 @@
     renderMapPins();
     renderHero();
     render();
+    saveLocal();
     syncPush();
   }
 
@@ -696,6 +697,7 @@
   function removeItem(day, idx){
     data[day].items.splice(idx, 1);
     render();
+    saveLocal();
     syncPush();
   }
 
@@ -738,6 +740,7 @@
 
     closeModal();
     render();
+    saveLocal();
     syncPush();
   });
 
@@ -812,6 +815,7 @@
     renderMapPins();
     renderHero();
     render();
+    saveLocal();
     syncPush();
   });
 
@@ -881,6 +885,29 @@
     return JSON.stringify({ tripInfo, data });
   }
 
+  // ---- local persistence (this page, this device -- keeps edits after a refresh) ----
+  const LOCAL_DATA_KEY = 'busanTrip_data_v1';
+  const LOCAL_SYNC_KEY = 'busanTrip_sync_v1';
+
+  function saveLocal(){
+    try{ localStorage.setItem(LOCAL_DATA_KEY, currentPayloadText()); }catch(e){ /* storage unavailable, ignore */ }
+  }
+  function loadLocal(){
+    try{
+      const text = localStorage.getItem(LOCAL_DATA_KEY);
+      return text ? JSON.parse(text) : null;
+    }catch(e){ return null; }
+  }
+  function saveSyncMeta(){
+    try{ localStorage.setItem(LOCAL_SYNC_KEY, JSON.stringify({backend: syncBackend, id: syncId})); }catch(e){ /* ignore */ }
+  }
+  function loadSyncMeta(){
+    try{
+      const text = localStorage.getItem(LOCAL_SYNC_KEY);
+      return text ? JSON.parse(text) : null;
+    }catch(e){ return null; }
+  }
+
   function applyPayload(obj){
     tripInfo = obj.tripInfo;
     data = obj.data;
@@ -890,6 +917,7 @@
     renderMapLegend();
     renderMapPins();
     render();
+    saveLocal();
   }
 
   function setSyncStatus(text){
@@ -947,6 +975,7 @@
         document.getElementById('syncCodeDisplay').style.display = 'block';
         document.getElementById('syncCodeText').value = shareCode();
         setSyncStatus('연결됨 (내가 코드 생성)');
+        saveSyncMeta();
         startPolling();
         return;
       }catch(e){
@@ -971,6 +1000,7 @@
         document.getElementById('syncCodeDisplay').style.display = 'block';
         document.getElementById('syncCodeText').value = shareCode();
         setSyncStatus('연결됨 (코드로 참여)');
+        saveSyncMeta();
         startPolling();
         closeSyncModal();
         return;
@@ -1043,15 +1073,35 @@
     renderMapPins();
   });
 
+  // restore this device's last saved edits (if any) before the first render,
+  // so a refresh doesn't lose local changes made through the +일정 추가 / 여행 정보 수정 forms
+  (function(){
+    const saved = loadLocal();
+    if(saved){ tripInfo = saved.tripInfo; data = saved.data; }
+  })();
+
   renderHero();
   renderTabs();
   renderMapLegend();
   render();
 
-  // if this file was opened with #sync=<code> in the address, auto-join that session
+  // if this file was opened with #sync=<code> in the address (e.g. a link shared
+  // by a friend), join that session -- otherwise, if this device previously
+  // connected to a session, silently reconnect to it
   (function(){
     const m = location.hash.match(/sync=([\w:-]+)/);
-    if(m) syncJoin(m[1]);
+    if(m){
+      syncJoin(m[1]);
+      return;
+    }
+    const meta = loadSyncMeta();
+    if(meta && meta.backend && meta.id){
+      syncBackend = meta.backend;
+      syncId = meta.id;
+      setSyncStatus('연결됨');
+      syncPull();
+      startPolling();
+    }
   })();
 </script>
 </body>
