@@ -822,9 +822,44 @@
   // ---------------- SYNC (co-edit with a friend) ----------------
   // Tries multiple free no-signup JSON-storage backends in order, since any
   // one of them can be flaky or block cross-origin requests. The working
-  // backend's name is stored as a prefix on the share code (e.g. "jsonblob:xxxx")
+  // backend's name is stored as a prefix on the share code (e.g. "jsonstorage:xxxx/yyyy")
   // so joining a session automatically uses the same backend.
+  //
+  // jsonstorage.net is tried first: it explicitly documents CORS support for
+  // any origin and needs no API key. jsonblob.com is kept as a fallback in
+  // case jsonstorage has an outage, even though it may not support CORS from
+  // arbitrary origins (kvdb.io was removed -- its real create endpoint needs
+  // an account email and its CORS support is undocumented, which is why it
+  // was failing with a 500 before).
   const SYNC_BACKENDS = {
+    jsonstorage: {
+      async create(bodyText){
+        const res = await fetch('https://api.jsonstorage.net/v1/json', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: bodyText
+        });
+        if(!res.ok) throw new Error('jsonstorage create ' + res.status);
+        const json = await res.json();
+        const uri = json && json.uri;
+        const m = uri && uri.match(/\/v1\/json\/(.+)$/);
+        if(!m) throw new Error('jsonstorage: no id');
+        return m[1]; // "{userId}/{itemId}"
+      },
+      async read(id){
+        const res = await fetch(`https://api.jsonstorage.net/v1/json/${id}`);
+        if(!res.ok) throw new Error('jsonstorage read ' + res.status);
+        return res.text();
+      },
+      async write(id, bodyText){
+        const res = await fetch(`https://api.jsonstorage.net/v1/json/${id}`, {
+          method: 'PUT',
+          headers: {'Content-Type': 'application/json'},
+          body: bodyText
+        });
+        if(!res.ok) throw new Error('jsonstorage write ' + res.status);
+      }
+    },
     jsonblob: {
       async create(bodyText){
         const res = await fetch('https://jsonblob.com/api/jsonBlob', {
@@ -851,32 +886,10 @@
         });
         if(!res.ok) throw new Error('jsonblob write ' + res.status);
       }
-    },
-    kvdb: {
-      async create(bodyText){
-        const res = await fetch('https://kvdb.io/', { method: 'POST' });
-        if(!res.ok) throw new Error('kvdb create ' + res.status);
-        const bucket = (await res.text()).trim();
-        if(!bucket) throw new Error('kvdb: no bucket id');
-        await this.write(bucket, bodyText);
-        return bucket;
-      },
-      async read(id){
-        const res = await fetch(`https://kvdb.io/${id}/data`);
-        if(!res.ok) throw new Error('kvdb read ' + res.status);
-        return res.text();
-      },
-      async write(id, bodyText){
-        const res = await fetch(`https://kvdb.io/${id}/data`, {
-          method: 'PUT',
-          body: bodyText
-        });
-        if(!res.ok) throw new Error('kvdb write ' + res.status);
-      }
     }
   };
 
-  let syncBackend = null; // 'jsonblob' | 'kvdb'
+  let syncBackend = null; // 'jsonstorage' | 'jsonblob'
   let syncId = null;
   let syncPollTimer = null;
   let lastSyncedText = null;
@@ -932,7 +945,7 @@
   function shareCode(){ return syncBackend + ':' + syncId; }
 
   function parseCode(code){
-    const m = code.trim().match(/^(jsonblob|kvdb):(.+)$/);
+    const m = code.trim().match(/^(jsonstorage|jsonblob|kvdb):(.+)$/);
     if(m) return { backend: m[1], id: m[2] };
     return { backend: null, id: code.trim() }; // legacy/plain code, try all backends
   }
@@ -987,7 +1000,7 @@
 
   async function syncJoin(rawCode){
     const { backend, id } = parseCode(rawCode);
-    const candidates = backend ? [backend] : Object.keys(SYNC_BACKENDS);
+    const candidates = (backend && SYNC_BACKENDS[backend]) ? [backend] : Object.keys(SYNC_BACKENDS);
     const errors = [];
     for(const name of candidates){
       try{
@@ -1089,7 +1102,7 @@
   // by a friend), join that session -- otherwise, if this device previously
   // connected to a session, silently reconnect to it
   (function(){
-    const m = location.hash.match(/sync=([\w:-]+)/);
+    const m = location.hash.match(/sync=([\w:/-]+)/);
     if(m){
       syncJoin(m[1]);
       return;
