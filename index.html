@@ -816,7 +816,63 @@
   });
 
   // ---------------- SYNC (co-edit with a friend) ----------------
-  const JSONBLOB_BASE = 'https://jsonblob.com/api/jsonBlob';
+  // Tries multiple free no-signup JSON-storage backends in order, since any
+  // one of them can be flaky or block cross-origin requests. The working
+  // backend's name is stored as a prefix on the share code (e.g. "jsonblob:xxxx")
+  // so joining a session automatically uses the same backend.
+  const SYNC_BACKENDS = {
+    jsonblob: {
+      async create(bodyText){
+        const res = await fetch('https://jsonblob.com/api/jsonBlob', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json', 'Accept': 'application/json'},
+          body: bodyText
+        });
+        if(!res.ok) throw new Error('jsonblob create ' + res.status);
+        const loc = res.headers.get('Location') || '';
+        const id = loc.split('/').filter(Boolean).pop();
+        if(!id) throw new Error('jsonblob: no id');
+        return id;
+      },
+      async read(id){
+        const res = await fetch(`https://jsonblob.com/api/jsonBlob/${id}`);
+        if(!res.ok) throw new Error('jsonblob read ' + res.status);
+        return res.text();
+      },
+      async write(id, bodyText){
+        const res = await fetch(`https://jsonblob.com/api/jsonBlob/${id}`, {
+          method: 'PUT',
+          headers: {'Content-Type': 'application/json'},
+          body: bodyText
+        });
+        if(!res.ok) throw new Error('jsonblob write ' + res.status);
+      }
+    },
+    kvdb: {
+      async create(bodyText){
+        const res = await fetch('https://kvdb.io/', { method: 'POST' });
+        if(!res.ok) throw new Error('kvdb create ' + res.status);
+        const bucket = (await res.text()).trim();
+        if(!bucket) throw new Error('kvdb: no bucket id');
+        await this.write(bucket, bodyText);
+        return bucket;
+      },
+      async read(id){
+        const res = await fetch(`https://kvdb.io/${id}/data`);
+        if(!res.ok) throw new Error('kvdb read ' + res.status);
+        return res.text();
+      },
+      async write(id, bodyText){
+        const res = await fetch(`https://kvdb.io/${id}/data`, {
+          method: 'PUT',
+          body: bodyText
+        });
+        if(!res.ok) throw new Error('kvdb write ' + res.status);
+      }
+    }
+  };
+
+  let syncBackend = null; // 'jsonblob' | 'kvdb'
   let syncId = null;
   let syncPollTimer = null;
   let lastSyncedText = null;
@@ -845,25 +901,27 @@
     if(btn) btn.textContent = syncId ? '👯 친구와 연결됨' : '👯 친구랑 같이 수정하기';
   }
 
+  function shareCode(){ return syncBackend + ':' + syncId; }
+
+  function parseCode(code){
+    const m = code.trim().match(/^(jsonblob|kvdb):(.+)$/);
+    if(m) return { backend: m[1], id: m[2] };
+    return { backend: null, id: code.trim() }; // legacy/plain code, try all backends
+  }
+
   async function syncPush(){
-    if(!syncId) return;
+    if(!syncId || !syncBackend) return;
     try{
       const body = currentPayloadText();
-      await fetch(`${JSONBLOB_BASE}/${syncId}`, {
-        method: 'PUT',
-        headers: {'Content-Type': 'application/json'},
-        body
-      });
+      await SYNC_BACKENDS[syncBackend].write(syncId, body);
       lastSyncedText = body;
     }catch(e){ /* offline or blocked -- silently skip, will retry on next edit/poll */ }
   }
 
   async function syncPull(){
-    if(!syncId) return;
+    if(!syncId || !syncBackend) return;
     try{
-      const res = await fetch(`${JSONBLOB_BASE}/${syncId}`);
-      if(!res.ok) return;
-      const text = await res.text();
+      const text = await SYNC_BACKENDS[syncBackend].read(syncId);
       if(text !== lastSyncedText){
         applyPayload(JSON.parse(text));
         lastSyncedText = text;
@@ -877,46 +935,50 @@
   }
 
   async function syncCreate(){
-    try{
-      const body = currentPayloadText();
-      const res = await fetch(JSONBLOB_BASE, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body
-      });
-      if(!res.ok) throw new Error('create failed');
-      const loc = res.headers.get('Location') || '';
-      const id = loc.split('/').filter(Boolean).pop();
-      if(!id) throw new Error('no id returned');
-      syncId = id;
-      lastSyncedText = body;
-      location.hash = 'sync=' + id;
-      document.getElementById('syncCodeDisplay').style.display = 'block';
-      document.getElementById('syncCodeText').value = id;
-      setSyncStatus('연결됨 (내가 코드 생성)');
-      startPolling();
-    }catch(e){
-      alert('코드 생성에 실패했어. 인터넷 연결을 확인하고 다시 시도해줘!');
+    const body = currentPayloadText();
+    const errors = [];
+    for(const name of Object.keys(SYNC_BACKENDS)){
+      try{
+        const id = await SYNC_BACKENDS[name].create(body);
+        syncBackend = name;
+        syncId = id;
+        lastSyncedText = body;
+        location.hash = 'sync=' + shareCode();
+        document.getElementById('syncCodeDisplay').style.display = 'block';
+        document.getElementById('syncCodeText').value = shareCode();
+        setSyncStatus('연결됨 (내가 코드 생성)');
+        startPolling();
+        return;
+      }catch(e){
+        errors.push(`${name}: ${e.message}`);
+      }
     }
+    alert('코드 생성에 실패했어. 아래 오류를 캡처해서 보내주면 원인을 바로 찾아볼게!\n\n' + errors.join('\n'));
   }
 
-  async function syncJoin(id){
-    try{
-      const res = await fetch(`${JSONBLOB_BASE}/${id}`);
-      if(!res.ok) throw new Error('not found');
-      const text = await res.text();
-      applyPayload(JSON.parse(text));
-      syncId = id;
-      lastSyncedText = text;
-      location.hash = 'sync=' + id;
-      document.getElementById('syncCodeDisplay').style.display = 'block';
-      document.getElementById('syncCodeText').value = id;
-      setSyncStatus('연결됨 (코드로 참여)');
-      startPolling();
-      closeSyncModal();
-    }catch(e){
-      alert('코드를 찾을 수 없어. 코드를 다시 확인해줘!');
+  async function syncJoin(rawCode){
+    const { backend, id } = parseCode(rawCode);
+    const candidates = backend ? [backend] : Object.keys(SYNC_BACKENDS);
+    const errors = [];
+    for(const name of candidates){
+      try{
+        const text = await SYNC_BACKENDS[name].read(id);
+        applyPayload(JSON.parse(text));
+        syncBackend = name;
+        syncId = id;
+        lastSyncedText = text;
+        location.hash = 'sync=' + shareCode();
+        document.getElementById('syncCodeDisplay').style.display = 'block';
+        document.getElementById('syncCodeText').value = shareCode();
+        setSyncStatus('연결됨 (코드로 참여)');
+        startPolling();
+        closeSyncModal();
+        return;
+      }catch(e){
+        errors.push(`${name}: ${e.message}`);
+      }
     }
+    alert('코드를 찾을 수 없어. 코드를 다시 확인해줘! (' + errors.join(' / ') + ')');
   }
 
   function openSyncModal(){
@@ -988,7 +1050,7 @@
 
   // if this file was opened with #sync=<code> in the address, auto-join that session
   (function(){
-    const m = location.hash.match(/sync=([\w-]+)/);
+    const m = location.hash.match(/sync=([\w:-]+)/);
     if(m) syncJoin(m[1]);
   })();
 </script>
